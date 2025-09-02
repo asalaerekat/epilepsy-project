@@ -1,0 +1,9 @@
+numpy
+pandas
+scikit-learn
+h2o
+openpyxl
+matplotlib
+seaborn
+statsmodels
+```
