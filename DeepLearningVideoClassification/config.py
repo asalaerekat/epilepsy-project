@@ -27,5 +27,6 @@ def get_args():
     parser.add_argument("--output_dir", type=str, default="checkpoints/", help="Directory to save models")
     parser.add_argument("--plot_dir", type=str, default="plots/", help="Directory to save loss plots")
     parser.add_argument("--best_fold", type=int, default=1, help="Pick best cv fold to start the finetuning on")
+    parser.add_argument("--eval_only", action="store_true", help="only do testing using a predefined fold")
     args = parser.parse_args()
     return args

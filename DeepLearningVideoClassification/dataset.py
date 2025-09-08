@@ -24,7 +24,7 @@ class VideoAugmentation:
             if not isinstance(aug, torch.Tensor):
                 aug = aug.to(torch.float32)
             frames.append(aug)
-        # stack back → (T, C, H, W) then permute → (C, T, H, W)
+        # stack back → (T, C, H, W) then permute (C, T, H, W)
         stacked = torch.stack(frames, dim=0).permute(1, 0, 2, 3)
         return stacked
 
@@ -50,8 +50,8 @@ class VideoDataset(Dataset):
 
     def _get_label(self, fn):
         lbl = os.path.splitext(fn)[0].split("_")[-1]
-        if lbl == "PNEE":    return 1
-        if lbl in ("GTC","FocalBilateralTC"): return 0
+        if lbl == "PNEE":    return 0
+        if lbl in ("GTC","FocalBilateralTC"): return 1
         raise ValueError("Unknown label in "+fn)
 
     def __getitem__(self, idx):
@@ -61,7 +61,7 @@ class VideoDataset(Dataset):
 
         vid, _, info = io.read_video(path, pts_unit="sec")  # (T,H,W,C)
         fps = info.get("video_fps", 25)
-        vid = vid.permute(0,3,1,2)  # → (T,C,H,W)
+        vid = vid.permute(0,3,1,2)  #  (T,C,H,W)
 
         # ensure 3 channels
         if vid.shape[1]==1:
