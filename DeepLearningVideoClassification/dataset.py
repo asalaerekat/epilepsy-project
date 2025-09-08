@@ -20,7 +20,7 @@ class VideoAugmentation:
             frame = video[:, t, :, :]          # (C, H, W)
             pil   = to_pil_image(frame)        # to PIL
             aug   = self.image_transform(pil)  # apply your transform
-            # ensure Tensor output: (C, H, W)
+            # Tensor output: (C, H, W)
             if not isinstance(aug, torch.Tensor):
                 aug = aug.to(torch.float32)
             frames.append(aug)
