@@ -1,3 +1,4 @@
+import json
 import os
 import random
 from collections import Counter
@@ -141,7 +142,12 @@ def build_optimizer_and_scheduler(model, args):
     return optimizer, scheduler
 
 
-def run_kfold(args, device, train_transform, val_transform):
+def save_df(df, csv_path, xlsx_path):
+    df.to_csv(csv_path, index=False)
+    df.to_excel(xlsx_path, index=False)
+
+
+def run_kfold_cv(args, device, train_transform, val_transform):
     internal_base_ds = build_dataset(
         args.video_dir, args.num_frames, transform=None, dataset_name="internal"
     )
@@ -151,29 +157,28 @@ def run_kfold(args, device, train_transform, val_transform):
 
     if len(all_files) < args.k_folds:
         raise ValueError(
-            f"k_folds={args.k_folds} is larger than the number of internal videos={len(all_files)}."
+            f"k_folds={args.k_folds} is larger than number of internal videos={len(all_files)}."
         )
     if len(unique_groups) < args.k_folds:
         raise ValueError(
-            f"k_folds={args.k_folds} is larger than the number of unique patients={len(unique_groups)}."
+            f"k_folds={args.k_folds} is larger than unique patients={len(unique_groups)}."
         )
 
-    manifest_df = pd.DataFrame(
-        {"filename": all_files, "patient_group": groups}
-    )
-    manifest_df.to_excel(
-        os.path.join(args.output_dir, "internal_dataset_manifest.xlsx"), index=False
-    )
-    manifest_df.to_csv(
-        os.path.join(args.output_dir, "internal_dataset_manifest.csv"), index=False
+    manifest_df = pd.DataFrame({"filename": all_files, "patient_group": groups})
+    save_df(
+        manifest_df,
+        os.path.join(args.output_dir, "internal_dataset_manifest.csv"),
+        os.path.join(args.output_dir, "internal_dataset_manifest.xlsx"),
     )
 
-    gkf = GroupKFold(n_splits=args.k_folds)
+    splitter = GroupKFold(n_splits=args.k_folds)
     youden_thresholds = []
+    stop_epochs = []
     fold_rows = []
 
-    for fold, (tr_idx, cv_idx) in enumerate(gkf.split(all_files, groups=groups), start=1):
+    for fold, (tr_idx, cv_idx) in enumerate(splitter.split(all_files, groups=groups), start=1):
         print(f"\n=== Fold {fold}/{args.k_folds} ===")
+
         tr_files = [all_files[i] for i in tr_idx]
         cv_files = [all_files[i] for i in cv_idx]
         tr_groups = set(groups[tr_idx].tolist())
@@ -201,35 +206,28 @@ def run_kfold(args, device, train_transform, val_transform):
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
         best_val_loss = float("inf")
-        best_val_probs_np = None
-        best_val_labels_np = None
+        best_val_probs = None
+        best_val_labels = None
         best_epoch = None
         train_losses = []
         val_losses = []
 
         for ep in range(1, args.epochs + 1):
             avg_train_loss = train_epoch(model, tr_loader, criterion, optimizer, device)
-            avg_val_loss, _, val_probs_np, val_labels_np = eval_epoch(
-                model, cv_loader, criterion, device
-            )
+            avg_val_loss, _, val_probs, val_labels = eval_epoch(model, cv_loader, criterion, device)
 
             train_losses.append(avg_train_loss)
             val_losses.append(avg_val_loss)
 
-            m05_val = compute_metrics_at_threshold(val_probs_np, val_labels_np, threshold=0.5)
-            val_auc = compute_auc(val_probs_np, val_labels_np)
-            val_auprc = compute_auprc(val_probs_np, val_labels_np)
+            m05 = compute_metrics_at_threshold(val_probs, val_labels, threshold=0.5)
+            val_auc = compute_auc(val_probs, val_labels)
+            val_auprc = compute_auprc(val_probs, val_labels)
 
             print(
-                f"[F{fold}E{ep}] "
-                f"tr_loss={avg_train_loss:.3f} | "
-                f"val_loss={avg_val_loss:.3f} | "
-                f"val_acc(0.5)={m05_val['accuracy']:.3f} | "
-                f"val_prec(0.5)={m05_val['precision']:.3f} | "
-                f"val_rec(0.5)={m05_val['recall']:.3f} | "
-                f"val_f1(0.5)={m05_val['f1']:.3f} | "
-                f"val_AUROC={val_auc:.3f} | "
-                f"val_AUPRC={val_auprc:.3f} | "
+                f"[F{fold}E{ep}] tr_loss={avg_train_loss:.3f} | val_loss={avg_val_loss:.3f} | "
+                f"val_acc(0.5)={m05['accuracy']:.3f} | val_prec(0.5)={m05['precision']:.3f} | "
+                f"val_rec(0.5)={m05['recall']:.3f} | val_f1(0.5)={m05['f1']:.3f} | "
+                f"val_AUROC={val_auc:.3f} | val_AUPRC={val_auprc:.3f} | "
                 f"lr={scheduler.get_last_lr()[0]:.2e}"
             )
 
@@ -237,52 +235,54 @@ def run_kfold(args, device, train_transform, val_transform):
 
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
-                best_val_probs_np = val_probs_np
-                best_val_labels_np = val_labels_np
+                best_val_probs = val_probs
+                best_val_labels = val_labels
                 best_epoch = ep
                 torch.save(model.state_dict(), os.path.join(args.output_dir, f"best_fold{fold}.pth"))
 
+        if best_epoch is None:
+            raise RuntimeError(f"No best epoch found for fold {fold}.")
+
         plot_loss_curves(train_losses, val_losses, fold, args.plot_dir)
 
-        fold_auroc = compute_auc(best_val_probs_np, best_val_labels_np)
-        fold_auprc = compute_auprc(best_val_probs_np, best_val_labels_np)
-        youden_t = compute_youden_threshold(best_val_labels_np, best_val_probs_np)
+        fold_auroc = compute_auc(best_val_probs, best_val_labels)
+        fold_auprc = compute_auprc(best_val_probs, best_val_labels)
+        youden_t = compute_youden_threshold(best_val_labels, best_val_probs)
+
+        stop_epochs.append(int(best_epoch))
         youden_thresholds.append(youden_t)
+
         print(
-            f"[Fold {fold}] best_epoch={best_epoch} | "
-            f"val_loss={best_val_loss:.3f} | AUROC={fold_auroc:.3f} | "
-            f"AUPRC={fold_auprc:.3f} | Youden={youden_t:.3f}"
+            f"[Fold {fold}] stop_epoch={best_epoch} | val_loss={best_val_loss:.3f} | "
+            f"AUROC={fold_auroc:.3f} | AUPRC={fold_auprc:.3f} | Youden={youden_t:.3f}"
         )
 
         fold_thresholds = sorted(set([0.10, 0.25, youden_t, 0.50, 0.75, 0.90]))
-        val_results = []
-        for threshold in fold_thresholds:
-            m = compute_metrics_at_threshold(
-                best_val_probs_np, best_val_labels_np, threshold=threshold
-            )
-            m["threshold"] = threshold
-            m["fold"] = fold
-            m["youden"] = youden_t
-            m["auroc"] = fold_auroc
-            m["auprc"] = fold_auprc
-            m["best_epoch"] = best_epoch
-            m["val_loss"] = best_val_loss
-            val_results.append(m)
-            print(
-                f"  [Fold {fold}] Th={threshold:.2f} | "
-                f"Acc={m['accuracy']:.3f} | "
-                f"Prec={m['precision']:.3f} | "
-                f"Rec={m['recall']:.3f} | "
-                f"Spec={m['specificity']:.3f} | "
-                f"F1={m['f1']:.3f}"
+        val_rows = []
+        for t in fold_thresholds:
+            m = compute_metrics_at_threshold(best_val_probs, best_val_labels, threshold=t)
+            val_rows.append(
+                {
+                    "fold": fold,
+                    "threshold": t,
+                    "youden_threshold": youden_t,
+                    "auroc": fold_auroc,
+                    "auprc": fold_auprc,
+                    "stop_epoch": best_epoch,
+                    "val_loss": best_val_loss,
+                    "accuracy": m["accuracy"],
+                    "precision": m["precision"],
+                    "recall": m["recall"],
+                    "specificity": m["specificity"],
+                    "f1": m["f1"],
+                }
             )
 
-        fold_val_df = pd.DataFrame(val_results)
-        fold_val_df.to_excel(
-            os.path.join(args.output_dir, f"fold{fold}_validation_metrics.xlsx"), index=False
-        )
-        fold_val_df.to_csv(
-            os.path.join(args.output_dir, f"fold{fold}_validation_metrics.csv"), index=False
+        fold_val_df = pd.DataFrame(val_rows)
+        save_df(
+            fold_val_df,
+            os.path.join(args.output_dir, f"fold{fold}_validation_metrics.csv"),
+            os.path.join(args.output_dir, f"fold{fold}_validation_metrics.xlsx"),
         )
 
         fold_rows.append(
@@ -292,7 +292,7 @@ def run_kfold(args, device, train_transform, val_transform):
                 "n_val_videos": len(cv_files),
                 "n_train_patients": len(tr_groups),
                 "n_val_patients": len(cv_groups),
-                "best_epoch": best_epoch,
+                "stop_epoch": best_epoch,
                 "val_loss": best_val_loss,
                 "auroc": fold_auroc,
                 "auprc": fold_auprc,
@@ -303,159 +303,221 @@ def run_kfold(args, device, train_transform, val_transform):
     np.save(os.path.join(args.output_dir, "youden_thresholds.npy"), np.array(youden_thresholds))
 
     fold_metrics_df = pd.DataFrame(fold_rows)
-    fold_metrics_df.to_csv(os.path.join(args.output_dir, "cv_fold_metrics.csv"), index=False)
-    fold_metrics_df.to_excel(os.path.join(args.output_dir, "cv_fold_metrics.xlsx"), index=False)
+    save_df(
+        fold_metrics_df,
+        os.path.join(args.output_dir, "cv_fold_metrics.csv"),
+        os.path.join(args.output_dir, "cv_fold_metrics.xlsx"),
+    )
 
     summary_rows = []
-    for metric in ["val_loss", "auroc", "auprc", "youden_threshold"]:
+    for metric in ["stop_epoch", "val_loss", "auroc", "auprc", "youden_threshold"]:
         mean = float(fold_metrics_df[metric].mean())
         std = float(fold_metrics_df[metric].std(ddof=1)) if len(fold_metrics_df) > 1 else 0.0
         summary_rows.append(
-            {
-                "metric": metric,
-                "mean": mean,
-                "std": std,
-                "mean_std": f"{mean:.4f}+/-{std:.4f}",
-            }
+            {"metric": metric, "mean": mean, "std": std, "mean_std": f"{mean:.4f}+/-{std:.4f}"}
         )
-
     cv_summary_df = pd.DataFrame(summary_rows)
     cv_summary_df.to_csv(os.path.join(args.output_dir, "cv_summary.csv"), index=False)
+
+    median_stop_epoch = int(np.rint(np.median(stop_epochs))) if stop_epochs else args.epochs
+    median_stop_epoch = max(1, min(args.epochs, median_stop_epoch))
+    avg_youden = float(np.mean(youden_thresholds)) if youden_thresholds else 0.5
 
     print("\n=== CV Summary (mean+/-std) ===")
     for row in summary_rows:
         print(f"{row['metric']}: {row['mean_std']}")
-    print("Saved fold checkpoints, per-fold metrics, and cv_summary.csv")
+    print(f"Median stop epoch from folds: {median_stop_epoch}")
+    print(f"Average Youden threshold from folds: {avg_youden:.4f}")
+
+    return {
+        "youden_thresholds": youden_thresholds,
+        "stop_epochs": stop_epochs,
+        "median_stop_epoch": median_stop_epoch,
+        "avg_youden_threshold": avg_youden,
+    }
 
 
-def run_final_train(args, device, train_transform):
+def save_final_threshold(args, cv_results):
+    avg_youden = cv_results["avg_youden_threshold"]
+    if args.use_avg_youden_threshold:
+        threshold = avg_youden
+        source = "avg_kfold_youden"
+    else:
+        threshold = 0.5
+        source = "default_0.5"
+
+    payload = {
+        "threshold": float(threshold),
+        "source": source,
+        "avg_kfold_youden_threshold": float(avg_youden),
+        "k_folds": int(args.k_folds),
+        "stop_epochs": [int(x) for x in cv_results["stop_epochs"]],
+        "median_stop_epoch": int(cv_results["median_stop_epoch"]),
+    }
+
+    out_path = os.path.join(args.output_dir, "final_threshold.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+    print(f"Saved final threshold config to {out_path} ({source}={threshold:.4f})")
+    return float(threshold), source
+
+
+def train_final_model(args, device, train_transform, stop_epoch):
     internal_ds = build_dataset(
         args.video_dir, args.num_frames, transform=train_transform, dataset_name="internal"
     )
-
-    pd.DataFrame({"filename": internal_ds.video_files}).to_excel(
-        os.path.join(args.output_dir, "internal_dataset_manifest.xlsx"), index=False
-    )
-
     train_loader = DataLoader(
-        internal_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
+        internal_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers
     )
 
-    pos_weight = compute_pos_weight(internal_ds, internal_ds.video_files, device)
     model = get_model(args.model, args.pretrained, 1).to(device)
-    optimizer, scheduler = build_optimizer_and_scheduler(model, args)
+    pos_weight = compute_pos_weight(internal_ds, internal_ds.video_files, device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    optimizer, scheduler = build_optimizer_and_scheduler(model, args)
 
-    best_train_loss = float("inf")
     history = []
-    for ep in range(1, args.epochs + 1):
+    for ep in range(1, stop_epoch + 1):
         avg_train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
-        history.append({"epoch": ep, "train_loss": avg_train_loss})
+        history.append(
+            {"epoch": ep, "train_loss": avg_train_loss, "lr": scheduler.get_last_lr()[0]}
+        )
         print(
-            f"[FinalTrain E{ep}] train_loss={avg_train_loss:.3f} | "
+            f"[FinalTrain E{ep}/{stop_epoch}] train_loss={avg_train_loss:.3f} | "
             f"lr={scheduler.get_last_lr()[0]:.2e}"
         )
         scheduler.step()
 
-        if avg_train_loss < best_train_loss:
-            best_train_loss = avg_train_loss
-            torch.save(model.state_dict(), os.path.join(args.output_dir, "final_model.pth"))
+    model_path = os.path.join(args.output_dir, "final_model.pth")
+    torch.save(model.state_dict(), model_path)
 
-    pd.DataFrame(history).to_excel(
-        os.path.join(args.output_dir, "final_train_history.xlsx"), index=False
-    )
-    print("Saved final model to final_model.pth")
-
-
-def resolve_eval_checkpoint(args):
-    fold_ckpt = os.path.join(args.output_dir, f"best_fold{args.best_fold}.pth")
-    final_ckpt = os.path.join(args.output_dir, "final_model.pth")
-
-    if os.path.exists(fold_ckpt):
-        return fold_ckpt
-    if os.path.exists(final_ckpt):
-        return final_ckpt
-
-    raise FileNotFoundError(
-        "No evaluation checkpoint found. Expected either "
-        f"{fold_ckpt} or {final_ckpt}."
+    history_df = pd.DataFrame(history)
+    save_df(
+        history_df,
+        os.path.join(args.output_dir, "final_train_history.csv"),
+        os.path.join(args.output_dir, "final_train_history.xlsx"),
     )
 
+    print(f"Saved final model to {model_path}")
+    return model_path
 
-def run_external_eval(args, device, val_transform):
+
+def evaluate_external(
+    args,
+    device,
+    val_transform,
+    checkpoint_path,
+    primary_threshold,
+    threshold_source,
+):
     if not args.external_video_dir:
-        raise ValueError("--external_video_dir is required when split_mode=external_eval")
+        raise ValueError("--external_video_dir is required for external evaluation.")
 
     external_ds = build_dataset(
-        args.external_video_dir,
-        args.num_frames,
-        transform=val_transform,
-        dataset_name="external",
+        args.external_video_dir, args.num_frames, transform=val_transform, dataset_name="external"
     )
-    pd.DataFrame({"filename": external_ds.video_files}).to_excel(
-        os.path.join(args.output_dir, "external_dataset_manifest.xlsx"), index=False
-    )
-
     external_loader = DataLoader(
-        external_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
+        external_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers
     )
 
-    ckpt_path = resolve_eval_checkpoint(args)
-    print(f"Evaluating checkpoint: {ckpt_path}")
+    manifest_df = pd.DataFrame({"filename": external_ds.video_files})
+    save_df(
+        manifest_df,
+        os.path.join(args.output_dir, "external_dataset_manifest.csv"),
+        os.path.join(args.output_dir, "external_dataset_manifest.xlsx"),
+    )
 
     model = get_model(args.model, args.pretrained, 1).to(device)
-    model.load_state_dict(torch.load(ckpt_path, map_location=device))
+    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
 
     criterion = nn.BCEWithLogitsLoss()
-    loss, _, probs_np, labels_np = eval_epoch(model, external_loader, criterion, device)
-    auroc = compute_auc(probs_np, labels_np)
-    auprc = compute_auprc(probs_np, labels_np)
-    print(f"External Loss: {loss:.3f} | AUROC: {auroc:.3f} | AUPRC: {auprc:.3f}")
+    loss, _, probs, labels = eval_epoch(model, external_loader, criterion, device)
+    auroc = compute_auc(probs, labels)
+    auprc = compute_auprc(probs, labels)
 
-    thresholds = [0.10, 0.25, 0.50, 0.75, 0.90]
-    youden_path = os.path.join(args.output_dir, "youden_thresholds.npy")
-    if os.path.exists(youden_path):
-        youden_thresholds = np.load(youden_path)
-        if 1 <= args.best_fold <= len(youden_thresholds):
-            thresholds.append(float(youden_thresholds[args.best_fold - 1]))
-
-    thresholds = sorted(set(thresholds))
-    results = []
-    for threshold in thresholds:
-        m = compute_metrics_at_threshold(probs_np, labels_np, threshold=threshold)
-        m["threshold"] = threshold
-        m["auroc"] = auroc
-        m["auprc"] = auprc
-        m["checkpoint"] = ckpt_path
-        results.append(m)
-        print(
-            f"External Th={threshold:.2f} | "
-            f"Acc={m['accuracy']:.3f} | "
-            f"Prec={m['precision']:.3f} | "
-            f"Rec={m['recall']:.3f} | "
-            f"Spec={m['specificity']:.3f} | "
-            f"F1={m['f1']:.3f}"
+    thresholds = sorted(set([0.5, float(primary_threshold)]))
+    threshold_rows = []
+    for t in thresholds:
+        m = compute_metrics_at_threshold(probs, labels, threshold=t)
+        threshold_rows.append(
+            {
+                "threshold": t,
+                "is_primary_threshold": int(np.isclose(t, primary_threshold)),
+                "threshold_source": threshold_source,
+                "loss": loss,
+                "auroc": auroc,
+                "auprc": auprc,
+                "accuracy": m["accuracy"],
+                "precision": m["precision"],
+                "recall": m["recall"],
+                "specificity": m["specificity"],
+                "f1": m["f1"],
+            }
         )
 
-    pd.DataFrame(results).to_excel(
-        os.path.join(args.output_dir, "external_metrics_by_threshold.xlsx"), index=False
+    threshold_df = pd.DataFrame(threshold_rows)
+    save_df(
+        threshold_df,
+        os.path.join(args.output_dir, "external_metrics_by_threshold.csv"),
+        os.path.join(args.output_dir, "external_metrics_by_threshold.xlsx"),
     )
-    print("Saved external evaluation metrics to external_metrics_by_threshold.xlsx")
+
+    primary_row = next(
+        row for row in threshold_rows if int(np.isclose(row["threshold"], primary_threshold)) == 1
+    )
+    summary_df = pd.DataFrame(
+        [
+            {
+                "checkpoint_path": checkpoint_path,
+                "threshold": primary_threshold,
+                "threshold_source": threshold_source,
+                "loss": loss,
+                "auroc": auroc,
+                "auprc": auprc,
+                "accuracy": primary_row["accuracy"],
+                "precision": primary_row["precision"],
+                "recall": primary_row["recall"],
+                "specificity": primary_row["specificity"],
+                "f1": primary_row["f1"],
+            }
+        ]
+    )
+    summary_df.to_csv(os.path.join(args.output_dir, "external_eval_summary.csv"), index=False)
+
+    print(
+        f"External eval | checkpoint={checkpoint_path} | threshold={primary_threshold:.4f} "
+        f"({threshold_source}) | loss={loss:.3f} | AUROC={auroc:.3f} | AUPRC={auprc:.3f}"
+    )
+    return summary_df.iloc[0].to_dict()
+
+
+def resolve_test_checkpoint(args):
+    if args.checkpoint_path is not None:
+        ckpt = args.checkpoint_path
+    else:
+        ckpt = os.path.join(args.output_dir, "final_model.pth")
+    if not os.path.exists(ckpt):
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt}")
+    return ckpt
+
+
+def resolve_test_threshold(args):
+    if args.threshold is not None:
+        return float(args.threshold), "cli_override"
+
+    final_threshold_path = os.path.join(args.output_dir, "final_threshold.json")
+    if os.path.exists(final_threshold_path):
+        with open(final_threshold_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if "threshold" in payload:
+            return float(payload["threshold"]), "final_threshold.json"
+
+    return 0.5, "default_0.5"
 
 
 def main():
     args = get_args()
     seed = 42
-
-    if args.eval_only:
-        print("`--eval_only` is deprecated; overriding split_mode to `external_eval`.")
-        args.split_mode = "external_eval"
 
     if args.device == "cuda" and not torch.cuda.is_available():
         print("CUDA requested but not available. Falling back to CPU.")
@@ -466,16 +528,46 @@ def main():
     set_seed(seed)
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(args.plot_dir, exist_ok=True)
+
     train_transform, val_transform = build_transforms()
 
-    if args.split_mode == "kfold":
-        run_kfold(args, device, train_transform, val_transform)
-    elif args.split_mode == "final_train":
-        run_final_train(args, device, train_transform)
-    elif args.split_mode == "external_eval":
-        run_external_eval(args, device, val_transform)
+    if args.run_mode == "train":
+        if not args.external_video_dir:
+            raise ValueError(
+                "--external_video_dir is required in train mode "
+                "(final model is evaluated on external testing set)."
+            )
+
+        cv_results = run_kfold_cv(args, device, train_transform, val_transform)
+        threshold, threshold_source = save_final_threshold(args, cv_results)
+        final_model_path = train_final_model(
+            args, device, train_transform, stop_epoch=cv_results["median_stop_epoch"]
+        )
+        evaluate_external(
+            args,
+            device,
+            val_transform,
+            checkpoint_path=final_model_path,
+            primary_threshold=threshold,
+            threshold_source=threshold_source,
+        )
+
+    elif args.run_mode == "test_only":
+        if not args.external_video_dir:
+            raise ValueError("--external_video_dir is required in test_only mode.")
+
+        checkpoint_path = resolve_test_checkpoint(args)
+        threshold, threshold_source = resolve_test_threshold(args)
+        evaluate_external(
+            args,
+            device,
+            val_transform,
+            checkpoint_path=checkpoint_path,
+            primary_threshold=threshold,
+            threshold_source=threshold_source,
+        )
     else:
-        raise ValueError(f"Unsupported split_mode: {args.split_mode}")
+        raise ValueError(f"Unsupported run_mode: {args.run_mode}")
 
 
 if __name__ == "__main__":
