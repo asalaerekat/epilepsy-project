@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torchvision.transforms as T
 from sklearn.metrics import roc_curve
-from sklearn.model_selection import KFold
+from sklearn.model_selection import GroupKFold
 from torch.utils.data import DataLoader
 
 from config import get_args
@@ -57,6 +57,11 @@ def build_dataset(video_dir, num_frames, transform, file_list=None, dataset_name
             "Expected filename suffixes matching class labels."
         )
     return ds
+
+
+def extract_patient_group(filename: str) -> str:
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    return stem.split("_")[0]
 
 
 def compute_pos_weight(base_dataset, files, device):
@@ -136,28 +141,45 @@ def build_optimizer_and_scheduler(model, args):
     return optimizer, scheduler
 
 
-def run_kfold(args, device, seed, train_transform, val_transform):
+def run_kfold(args, device, train_transform, val_transform):
     internal_base_ds = build_dataset(
         args.video_dir, args.num_frames, transform=None, dataset_name="internal"
     )
-    all_files = internal_base_ds.video_files
+    all_files = sorted(internal_base_ds.video_files)
+    groups = np.array([extract_patient_group(fn) for fn in all_files])
+    unique_groups = np.unique(groups)
 
     if len(all_files) < args.k_folds:
         raise ValueError(
             f"k_folds={args.k_folds} is larger than the number of internal videos={len(all_files)}."
         )
+    if len(unique_groups) < args.k_folds:
+        raise ValueError(
+            f"k_folds={args.k_folds} is larger than the number of unique patients={len(unique_groups)}."
+        )
 
-    pd.DataFrame({"filename": all_files}).to_excel(
+    manifest_df = pd.DataFrame(
+        {"filename": all_files, "patient_group": groups}
+    )
+    manifest_df.to_excel(
         os.path.join(args.output_dir, "internal_dataset_manifest.xlsx"), index=False
     )
+    manifest_df.to_csv(
+        os.path.join(args.output_dir, "internal_dataset_manifest.csv"), index=False
+    )
 
-    kf = KFold(n_splits=args.k_folds, shuffle=True, random_state=seed)
+    gkf = GroupKFold(n_splits=args.k_folds)
     youden_thresholds = []
+    fold_rows = []
 
-    for fold, (tr_idx, cv_idx) in enumerate(kf.split(all_files), start=1):
+    for fold, (tr_idx, cv_idx) in enumerate(gkf.split(all_files, groups=groups), start=1):
         print(f"\n=== Fold {fold}/{args.k_folds} ===")
         tr_files = [all_files[i] for i in tr_idx]
         cv_files = [all_files[i] for i in cv_idx]
+        tr_groups = set(groups[tr_idx].tolist())
+        cv_groups = set(groups[cv_idx].tolist())
+        if tr_groups.intersection(cv_groups):
+            raise RuntimeError(f"Group leakage detected in fold {fold}.")
 
         tr_ds = build_dataset(
             args.video_dir, args.num_frames, transform=train_transform, file_list=tr_files
@@ -181,6 +203,7 @@ def run_kfold(args, device, seed, train_transform, val_transform):
         best_val_loss = float("inf")
         best_val_probs_np = None
         best_val_labels_np = None
+        best_epoch = None
         train_losses = []
         val_losses = []
 
@@ -216,13 +239,20 @@ def run_kfold(args, device, seed, train_transform, val_transform):
                 best_val_loss = avg_val_loss
                 best_val_probs_np = val_probs_np
                 best_val_labels_np = val_labels_np
+                best_epoch = ep
                 torch.save(model.state_dict(), os.path.join(args.output_dir, f"best_fold{fold}.pth"))
 
         plot_loss_curves(train_losses, val_losses, fold, args.plot_dir)
 
+        fold_auroc = compute_auc(best_val_probs_np, best_val_labels_np)
+        fold_auprc = compute_auprc(best_val_probs_np, best_val_labels_np)
         youden_t = compute_youden_threshold(best_val_labels_np, best_val_probs_np)
         youden_thresholds.append(youden_t)
-        print(f"[Fold {fold}] Youden optimal threshold = {youden_t:.3f}")
+        print(
+            f"[Fold {fold}] best_epoch={best_epoch} | "
+            f"val_loss={best_val_loss:.3f} | AUROC={fold_auroc:.3f} | "
+            f"AUPRC={fold_auprc:.3f} | Youden={youden_t:.3f}"
+        )
 
         fold_thresholds = sorted(set([0.10, 0.25, youden_t, 0.50, 0.75, 0.90]))
         val_results = []
@@ -233,6 +263,10 @@ def run_kfold(args, device, seed, train_transform, val_transform):
             m["threshold"] = threshold
             m["fold"] = fold
             m["youden"] = youden_t
+            m["auroc"] = fold_auroc
+            m["auprc"] = fold_auprc
+            m["best_epoch"] = best_epoch
+            m["val_loss"] = best_val_loss
             val_results.append(m)
             print(
                 f"  [Fold {fold}] Th={threshold:.2f} | "
@@ -243,12 +277,55 @@ def run_kfold(args, device, seed, train_transform, val_transform):
                 f"F1={m['f1']:.3f}"
             )
 
-        pd.DataFrame(val_results).to_excel(
+        fold_val_df = pd.DataFrame(val_results)
+        fold_val_df.to_excel(
             os.path.join(args.output_dir, f"fold{fold}_validation_metrics.xlsx"), index=False
+        )
+        fold_val_df.to_csv(
+            os.path.join(args.output_dir, f"fold{fold}_validation_metrics.csv"), index=False
+        )
+
+        fold_rows.append(
+            {
+                "fold": fold,
+                "n_train_videos": len(tr_files),
+                "n_val_videos": len(cv_files),
+                "n_train_patients": len(tr_groups),
+                "n_val_patients": len(cv_groups),
+                "best_epoch": best_epoch,
+                "val_loss": best_val_loss,
+                "auroc": fold_auroc,
+                "auprc": fold_auprc,
+                "youden_threshold": youden_t,
+            }
         )
 
     np.save(os.path.join(args.output_dir, "youden_thresholds.npy"), np.array(youden_thresholds))
-    print("\nSaved fold checkpoints and per-fold Youden thresholds.")
+
+    fold_metrics_df = pd.DataFrame(fold_rows)
+    fold_metrics_df.to_csv(os.path.join(args.output_dir, "cv_fold_metrics.csv"), index=False)
+    fold_metrics_df.to_excel(os.path.join(args.output_dir, "cv_fold_metrics.xlsx"), index=False)
+
+    summary_rows = []
+    for metric in ["val_loss", "auroc", "auprc", "youden_threshold"]:
+        mean = float(fold_metrics_df[metric].mean())
+        std = float(fold_metrics_df[metric].std(ddof=1)) if len(fold_metrics_df) > 1 else 0.0
+        summary_rows.append(
+            {
+                "metric": metric,
+                "mean": mean,
+                "std": std,
+                "mean_std": f"{mean:.4f}+/-{std:.4f}",
+            }
+        )
+
+    cv_summary_df = pd.DataFrame(summary_rows)
+    cv_summary_df.to_csv(os.path.join(args.output_dir, "cv_summary.csv"), index=False)
+
+    print("\n=== CV Summary (mean+/-std) ===")
+    for row in summary_rows:
+        print(f"{row['metric']}: {row['mean_std']}")
+    print("Saved fold checkpoints, per-fold metrics, and cv_summary.csv")
 
 
 def run_final_train(args, device, train_transform):
@@ -392,7 +469,7 @@ def main():
     train_transform, val_transform = build_transforms()
 
     if args.split_mode == "kfold":
-        run_kfold(args, device, seed, train_transform, val_transform)
+        run_kfold(args, device, train_transform, val_transform)
     elif args.split_mode == "final_train":
         run_final_train(args, device, train_transform)
     elif args.split_mode == "external_eval":
