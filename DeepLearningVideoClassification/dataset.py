@@ -36,7 +36,7 @@ class VideoDataset(Dataset):
     """
     def __init__(self, video_dir, num_frames=16, transform=None, file_list=None):
         self.video_dir   = video_dir
-        endings = ("PNEE.mp4","GTC.mp4","FocalBilateralTC.mp4")
+        endings = ("PNEE.mp4", "FDS.mp4", "GTC.mp4", "FocalBilateralTC.mp4", "ES.mp4")
         if file_list is None:
             self.video_files = [f for f in os.listdir(video_dir) if f.endswith(endings)]
         else:
@@ -50,8 +50,8 @@ class VideoDataset(Dataset):
 
     def _get_label(self, fn):
         lbl = os.path.splitext(fn)[0].split("_")[-1]
-        if lbl == "PNEE":    return 0
-        if lbl in ("GTC","FocalBilateralTC"): return 1
+        if lbl in ("PNEE", "FDS"): return 0
+        if lbl in ("GTC", "FocalBilateralTC", "ES"): return 1
         raise ValueError("Unknown label in "+fn)
 
     def __getitem__(self, idx):
