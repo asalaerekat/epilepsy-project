@@ -78,9 +78,11 @@ def compute_pos_weight(base_dataset, files, device):
     return torch.tensor([neg / pos], dtype=torch.float32, device=device)
 
 
-def train_epoch(model, loader, criterion, optimizer, device):
+def train_epoch(model, loader, criterion, optimizer, device, return_probs_labels=False):
     model.train()
     total_loss = 0.0
+    all_logits = []
+    all_labels = []
 
     for x, y in loader:
         x = x.to(device)
@@ -93,8 +95,18 @@ def train_epoch(model, loader, criterion, optimizer, device):
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         total_loss += loss.item() * x.size(0)
+        if return_probs_labels:
+            all_logits.append(out.detach().cpu())
+            all_labels.append(y.detach().cpu())
 
-    return total_loss / len(loader.dataset)
+    avg_loss = total_loss / len(loader.dataset)
+    if not return_probs_labels:
+        return avg_loss
+
+    logits = torch.cat(all_logits).numpy()
+    labels = torch.cat(all_labels).numpy().astype(int)
+    probs = torch.sigmoid(torch.from_numpy(logits)).numpy()
+    return avg_loss, logits, probs, labels
 
 
 def eval_epoch(model, loader, criterion, device):
@@ -274,25 +286,66 @@ def run_kfold_cv(args, device, train_transform, val_transform):
         best_epoch = None
         train_losses = []
         val_losses = []
+        epoch_rows = []
 
         for ep in range(1, args.epochs + 1):
-            avg_train_loss = train_epoch(model, tr_loader, criterion, optimizer, device)
+            avg_train_loss, _, train_probs, train_labels = train_epoch(
+                model,
+                tr_loader,
+                criterion,
+                optimizer,
+                device,
+                return_probs_labels=True,
+            )
             avg_val_loss, _, val_probs, val_labels = eval_epoch(model, cv_loader, criterion, device)
 
             train_losses.append(avg_train_loss)
             val_losses.append(avg_val_loss)
 
+            m05_train = compute_metrics_at_threshold(train_probs, train_labels, threshold=0.5)
             m05 = compute_metrics_at_threshold(val_probs, val_labels, threshold=0.5)
             val_auc = compute_auc(val_probs, val_labels)
             val_auprc = compute_auprc(val_probs, val_labels)
 
             print(
                 f"[F{fold}E{ep}] tr_loss={avg_train_loss:.3f} | val_loss={avg_val_loss:.3f} | "
+                f"tr_TP={m05_train['tp']} tr_TN={m05_train['tn']} tr_FP={m05_train['fp']} tr_FN={m05_train['fn']} | "
                 f"val_acc(0.5)={m05['accuracy']:.3f} | val_prec(0.5)={m05['precision']:.3f} | "
                 f"val_rec(0.5)={m05['recall']:.3f} | val_f1(0.5)={m05['f1']:.3f} | "
+                f"val_TP={m05['tp']} val_TN={m05['tn']} val_FP={m05['fp']} val_FN={m05['fn']} | "
                 f"val_AUROC={val_auc:.3f} | val_AUPRC={val_auprc:.3f} | "
                 f"lr={format_lrs(optimizer)}"
             )
+
+            epoch_row = {
+                "fold": fold,
+                "epoch": ep,
+                "train_loss": avg_train_loss,
+                "val_loss": avg_val_loss,
+                "val_auroc": val_auc,
+                "val_auprc": val_auprc,
+                "threshold": 0.5,
+                "train_accuracy": m05_train["accuracy"],
+                "train_precision": m05_train["precision"],
+                "train_recall": m05_train["recall"],
+                "train_specificity": m05_train["specificity"],
+                "train_f1": m05_train["f1"],
+                "train_tn": m05_train["tn"],
+                "train_fp": m05_train["fp"],
+                "train_fn": m05_train["fn"],
+                "train_tp": m05_train["tp"],
+                "val_accuracy": m05["accuracy"],
+                "val_precision": m05["precision"],
+                "val_recall": m05["recall"],
+                "val_specificity": m05["specificity"],
+                "val_f1": m05["f1"],
+                "val_tn": m05["tn"],
+                "val_fp": m05["fp"],
+                "val_fn": m05["fn"],
+                "val_tp": m05["tp"],
+            }
+            epoch_row.update(lr_columns(optimizer))
+            epoch_rows.append(epoch_row)
 
             scheduler.step()
 
@@ -305,6 +358,13 @@ def run_kfold_cv(args, device, train_transform, val_transform):
 
         if best_epoch is None:
             raise RuntimeError(f"No best epoch found for fold {fold}.")
+
+        fold_epoch_df = pd.DataFrame(epoch_rows)
+        save_df(
+            fold_epoch_df,
+            os.path.join(args.output_dir, f"fold{fold}_epoch_metrics.csv"),
+            os.path.join(args.output_dir, f"fold{fold}_epoch_metrics.xlsx"),
+        )
 
         plot_loss_curves(train_losses, val_losses, fold, args.plot_dir)
 
@@ -338,6 +398,10 @@ def run_kfold_cv(args, device, train_transform, val_transform):
                     "recall": m["recall"],
                     "specificity": m["specificity"],
                     "f1": m["f1"],
+                    "tn": m["tn"],
+                    "fp": m["fp"],
+                    "fn": m["fn"],
+                    "tp": m["tp"],
                 }
             )
 
@@ -442,12 +506,34 @@ def train_final_model(args, device, train_transform, stop_epoch):
 
     history = []
     for ep in range(1, stop_epoch + 1):
-        avg_train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
-        row = {"epoch": ep, "train_loss": avg_train_loss}
+        avg_train_loss, _, train_probs, train_labels = train_epoch(
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            device,
+            return_probs_labels=True,
+        )
+        m05_train = compute_metrics_at_threshold(train_probs, train_labels, threshold=0.5)
+        row = {
+            "epoch": ep,
+            "train_loss": avg_train_loss,
+            "threshold": 0.5,
+            "train_accuracy": m05_train["accuracy"],
+            "train_precision": m05_train["precision"],
+            "train_recall": m05_train["recall"],
+            "train_specificity": m05_train["specificity"],
+            "train_f1": m05_train["f1"],
+            "train_tn": m05_train["tn"],
+            "train_fp": m05_train["fp"],
+            "train_fn": m05_train["fn"],
+            "train_tp": m05_train["tp"],
+        }
         row.update(lr_columns(optimizer))
         history.append(row)
         print(
             f"[FinalTrain E{ep}/{stop_epoch}] train_loss={avg_train_loss:.3f} | "
+            f"train_TP={m05_train['tp']} train_TN={m05_train['tn']} train_FP={m05_train['fp']} train_FN={m05_train['fn']} | "
             f"lr={format_lrs(optimizer)}"
         )
         scheduler.step()
@@ -516,6 +602,10 @@ def evaluate_external(
                 "recall": m["recall"],
                 "specificity": m["specificity"],
                 "f1": m["f1"],
+                "tn": m["tn"],
+                "fp": m["fp"],
+                "fn": m["fn"],
+                "tp": m["tp"],
             }
         )
 
@@ -543,6 +633,10 @@ def evaluate_external(
                 "recall": primary_row["recall"],
                 "specificity": primary_row["specificity"],
                 "f1": primary_row["f1"],
+                "tn": primary_row["tn"],
+                "fp": primary_row["fp"],
+                "fn": primary_row["fn"],
+                "tp": primary_row["tp"],
             }
         ]
     )
