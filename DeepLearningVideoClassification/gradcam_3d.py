@@ -1,74 +1,126 @@
 import torch
 import torch.nn.functional as F
 
+
 class GradCAM3D:
     """
     3D Grad-CAM for video models.
-    Returns CAM: (N, T, H, W) normalized to [0,1] per sample.
+
+    Input:
+      - x: Tensor of shape (N, C, T, H, W), normalized input clip.
+
+    Output:
+      - cam: Tensor of shape (N, T, H, W), normalized to [0, 1] per sample
+             and upsampled to input (T, H, W) with trilinear interpolation.
     """
-    def __init__(self, model: torch.nn.Module, target_layer: torch.nn.Module):
+
+    def __init__(self, model: torch.nn.Module, target_layer: torch.nn.Module = None):
         self.model = model
-        self.target_layer = target_layer
+        self.target_layer = target_layer if target_layer is not None else self._default_target_layer()
         self.activations = None  # (N, C, t, h, w)
         self.gradients = None    # (N, C, t, h, w)
         self.handles = []
-        self._register()
+        self._register_hooks()
 
-    def _register(self):
-        def fwd_hook(_, __, output):
+    def _unwrap_model(self) -> torch.nn.Module:
+        return self.model.module if hasattr(self.model, "module") else self.model
+
+    def _default_target_layer(self) -> torch.nn.Module:
+        """
+        Default for torchvision r3d_18:
+          model.layer4[-1].conv2
+        """
+        base_model = self._unwrap_model()
+        try:
+            return base_model.layer4[-1].conv2
+        except Exception as exc:
+            raise ValueError(
+                "Could not resolve default target layer. "
+                "Pass `target_layer` explicitly."
+            ) from exc
+
+    def _register_hooks(self):
+        def forward_hook(_, __, output):
             self.activations = output
 
-        def bwd_hook(_, grad_in, grad_out):
+        def backward_hook(_, __, grad_out):
             self.gradients = grad_out[0]
 
-        self.handles.append(self.target_layer.register_forward_hook(fwd_hook))
-        self.handles.append(self.target_layer.register_full_backward_hook(bwd_hook))
+        self.handles.append(self.target_layer.register_forward_hook(forward_hook))
+        self.handles.append(self.target_layer.register_full_backward_hook(backward_hook))
 
     def close(self):
-        for h in self.handles:
-            h.remove()
+        for handle in self.handles:
+            handle.remove()
         self.handles = []
 
+    def __del__(self):
+        # Best-effort hook cleanup if caller forgets to call close()
+        try:
+            self.close()
+        except Exception:
+            pass
+
     @staticmethod
-    def _norm(cam: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    def _normalize_cam(cam: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
         # cam: (N, T, H, W)
         n = cam.shape[0]
-        flat = cam.view(n, -1)
-        mn = flat.min(dim=1).values.view(n, 1, 1, 1)
-        mx = flat.max(dim=1).values.view(n, 1, 1, 1)
-        return (cam - mn) / (mx - mn + eps)
+        flat = cam.reshape(n, -1)
+        min_v = flat.min(dim=1).values.reshape(n, 1, 1, 1)
+        max_v = flat.max(dim=1).values.reshape(n, 1, 1, 1)
+        return (cam - min_v) / (max_v - min_v + eps)
+
+    @staticmethod
+    def _resolve_class_indices(logits: torch.Tensor, class_idx):
+        n, k = logits.shape
+        if class_idx is None:
+            return logits.argmax(dim=1)
+        if isinstance(class_idx, int):
+            idx = torch.full((n,), class_idx, device=logits.device, dtype=torch.long)
+        else:
+            idx = torch.as_tensor(class_idx, device=logits.device, dtype=torch.long)
+            if idx.ndim != 1 or idx.numel() != n:
+                raise ValueError(
+                    f"class_idx must be int or shape (N,), got shape {tuple(idx.shape)} for N={n}."
+                )
+
+        if idx.min().item() < 0 or idx.max().item() >= k:
+            raise ValueError(f"class_idx values must be in [0, {k - 1}].")
+        return idx
 
     def __call__(self, x: torch.Tensor, class_idx=None) -> torch.Tensor:
         """
-        x: (N, C, T, H, W) normalized clip tensor.
-        class_idx:
-          - None: for binary logits (B,1) uses that score; for multiclass uses argmax per sample
-          - int: class index to explain
-          - Tensor/list shape (N,): per-sample class indices
+        Args:
+          x: (N, C, T, H, W)
+          class_idx:
+            - None:
+                - binary head (N,1): explain logit[:,0]
+                - multiclass (N,K): explain argmax class per sample
+            - int: explain one class for all samples (multiclass)
+            - list/Tensor shape (N,): class index per sample (multiclass)
         """
+        if x.ndim != 5:
+            raise ValueError(f"Expected x with shape (N,C,T,H,W), got {tuple(x.shape)}.")
+
         self.model.eval()
+        self.activations = None
+        self.gradients = None
 
-        # IMPORTANT: do NOT wrap in torch.no_grad()
+        # Do not wrap in torch.no_grad(), we need gradients for CAM.
         x = x.requires_grad_(True)
+        logits = self.model(x)
 
-        logits = self.model(x)  # (N,1) in your code, or (N,K) in multiclass
         if logits.ndim == 1:
             logits = logits.unsqueeze(1)
+        if logits.ndim != 2:
+            raise ValueError(f"Expected model output shape (N,1) or (N,K), got {tuple(logits.shape)}.")
 
-        N, K = logits.shape
-
-        # choose target score
-        if K == 1:
+        n, k = logits.shape
+        if k == 1:
             score = logits[:, 0].sum()
         else:
-            if class_idx is None:
-                idx = logits.argmax(dim=1)
-            elif isinstance(class_idx, int):
-                idx = torch.full((N,), class_idx, device=logits.device, dtype=torch.long)
-            else:
-                idx = torch.as_tensor(class_idx, device=logits.device, dtype=torch.long)
-
-            score = logits[torch.arange(N, device=logits.device), idx].sum()
+            idx = self._resolve_class_indices(logits, class_idx)
+            score = logits[torch.arange(n, device=logits.device), idx].sum()
 
         self.model.zero_grad(set_to_none=True)
         score.backward()
@@ -76,23 +128,20 @@ class GradCAM3D:
         if self.activations is None or self.gradients is None:
             raise RuntimeError("No activations/gradients captured. Check target_layer selection.")
 
-        acts = self.activations          # (N, C, t, h, w)
-        grads = self.gradients           # (N, C, t, h, w)
+        acts = self.activations
+        grads = self.gradients
 
-        # channel weights = GAP over (t,h,w)
-        w = grads.mean(dim=(2,3,4), keepdim=True)  # (N,C,1,1,1)
+        # Channel weights: global-average pool gradients over (t, h, w)
+        weights = grads.mean(dim=(2, 3, 4), keepdim=True)  # (N,C,1,1,1)
+        cam = F.relu((weights * acts).sum(dim=1))          # (N,t,h,w)
 
-        cam = (w * acts).sum(dim=1)  # (N,t,h,w)
-        cam = F.relu(cam)
-
-        # upsample to input (T,H,W)
-        cam = cam.unsqueeze(1)  # (N,1,t,h,w)
+        # Upsample to input resolution (T,H,W)
         cam = F.interpolate(
-            cam,
+            cam.unsqueeze(1),
             size=(x.shape[2], x.shape[3], x.shape[4]),
             mode="trilinear",
             align_corners=False,
-        ).squeeze(1)  # (N,T,H,W)
+        ).squeeze(1)
 
-        cam = self._norm(cam.detach())
+        cam = self._normalize_cam(cam.detach())
         return cam

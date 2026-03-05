@@ -26,9 +26,22 @@ def get_args():
     # Training parameters
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--learning_rate", type=float, default=1e-3,
+                        help="Learning rate for classifier head (fc)")
+    parser.add_argument("--layer4_learning_rate", type=float, default=1e-4,
+                        help="Learning rate for backbone layer4")
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--k_folds", type=int, default=5, help="Number of folds for cross validation")
+    parser.add_argument("--scheduler", type=str, default="step",
+                        choices=["step", "cosine"], help="Learning rate scheduler type")
+    parser.add_argument("--lr_step_size", type=int, default=10,
+                        help="StepLR step size (used when --scheduler step)")
+    parser.add_argument("--lr_gamma", type=float, default=0.5,
+                        help="StepLR gamma (used when --scheduler step)")
+    parser.add_argument("--lr_t_max", type=int, default=0,
+                        help="CosineAnnealingLR T_max (0 means use --epochs)")
+    parser.add_argument("--lr_eta_min", type=float, default=1e-6,
+                        help="CosineAnnealingLR eta_min (used when --scheduler cosine)")
     parser.add_argument("--device", type=str, default="cuda", help="Device to use for training")
     parser.add_argument("--output_dir", type=str, default="checkpoints/", help="Directory to save models")
     parser.add_argument("--plot_dir", type=str, default="plots/", help="Directory to save loss plots")

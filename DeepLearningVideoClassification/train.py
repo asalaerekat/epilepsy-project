@@ -132,19 +132,81 @@ def compute_youden_threshold(labels_np, probs_np):
     return float(thresholds[np.argmax(j_scores)])
 
 
-def build_optimizer_and_scheduler(model, args):
-    optimizer = optim.Adam(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay,
-    )
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.2)
+def build_optimizer_and_scheduler(model, args, total_epochs=None):
+    base_model = model.module if hasattr(model, "module") else model
+
+    param_groups = []
+    if hasattr(base_model, "fc") and hasattr(base_model, "layer4"):
+        fc_params = [p for p in base_model.fc.parameters() if p.requires_grad]
+        layer4_params = [p for p in base_model.layer4.parameters() if p.requires_grad]
+
+        seen_param_ids = {id(p) for p in fc_params + layer4_params}
+        other_params = [
+            p for p in base_model.parameters()
+            if p.requires_grad and id(p) not in seen_param_ids
+        ]
+
+        if fc_params:
+            param_groups.append({"params": fc_params, "lr": args.learning_rate, "name": "fc"})
+        if layer4_params:
+            param_groups.append(
+                {"params": layer4_params, "lr": args.layer4_learning_rate, "name": "layer4"}
+            )
+        if other_params:
+            param_groups.append(
+                {"params": other_params, "lr": args.layer4_learning_rate, "name": "other"}
+            )
+    else:
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        if trainable_params:
+            param_groups.append({"params": trainable_params, "lr": args.learning_rate, "name": "all"})
+
+    if not param_groups:
+        raise ValueError("No trainable parameters found for optimizer.")
+
+    optimizer = optim.Adam(param_groups, weight_decay=args.weight_decay)
+    if args.scheduler == "step":
+        scheduler = optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=args.lr_step_size,
+            gamma=args.lr_gamma,
+        )
+    elif args.scheduler == "cosine":
+        if total_epochs is None:
+            total_epochs = args.epochs
+        t_max = args.lr_t_max if args.lr_t_max > 0 else total_epochs
+        t_max = max(1, int(t_max))
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=t_max,
+            eta_min=args.lr_eta_min,
+        )
+    else:
+        raise ValueError(f"Unsupported scheduler: {args.scheduler}")
+
     return optimizer, scheduler
 
 
 def save_df(df, csv_path, xlsx_path):
     df.to_csv(csv_path, index=False)
     df.to_excel(xlsx_path, index=False)
+
+
+def format_lrs(optimizer):
+    pieces = []
+    for i, group in enumerate(optimizer.param_groups):
+        name = group.get("name", f"group{i}")
+        pieces.append(f"{name}:{group['lr']:.2e}")
+    return ", ".join(pieces)
+
+
+def lr_columns(optimizer):
+    columns = {}
+    for i, group in enumerate(optimizer.param_groups):
+        name = group.get("name", f"group{i}")
+        safe_name = name.replace(" ", "_")
+        columns[f"lr_{safe_name}"] = float(group["lr"])
+    return columns
 
 
 def run_kfold_cv(args, device, train_transform, val_transform):
@@ -202,8 +264,9 @@ def run_kfold_cv(args, device, train_transform, val_transform):
 
         pos_weight = compute_pos_weight(internal_base_ds, tr_files, device)
         model = get_model(args.model, args.pretrained, 1).to(device)
-        optimizer, scheduler = build_optimizer_and_scheduler(model, args)
+        optimizer, scheduler = build_optimizer_and_scheduler(model, args, total_epochs=args.epochs)
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        print(f"[Fold {fold}] LR groups -> {format_lrs(optimizer)}")
 
         best_val_loss = float("inf")
         best_val_probs = None
@@ -228,7 +291,7 @@ def run_kfold_cv(args, device, train_transform, val_transform):
                 f"val_acc(0.5)={m05['accuracy']:.3f} | val_prec(0.5)={m05['precision']:.3f} | "
                 f"val_rec(0.5)={m05['recall']:.3f} | val_f1(0.5)={m05['f1']:.3f} | "
                 f"val_AUROC={val_auc:.3f} | val_AUPRC={val_auprc:.3f} | "
-                f"lr={scheduler.get_last_lr()[0]:.2e}"
+                f"lr={format_lrs(optimizer)}"
             )
 
             scheduler.step()
@@ -374,17 +437,18 @@ def train_final_model(args, device, train_transform, stop_epoch):
     model = get_model(args.model, args.pretrained, 1).to(device)
     pos_weight = compute_pos_weight(internal_ds, internal_ds.video_files, device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    optimizer, scheduler = build_optimizer_and_scheduler(model, args)
+    optimizer, scheduler = build_optimizer_and_scheduler(model, args, total_epochs=stop_epoch)
+    print(f"[FinalTrain] LR groups -> {format_lrs(optimizer)}")
 
     history = []
     for ep in range(1, stop_epoch + 1):
         avg_train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
-        history.append(
-            {"epoch": ep, "train_loss": avg_train_loss, "lr": scheduler.get_last_lr()[0]}
-        )
+        row = {"epoch": ep, "train_loss": avg_train_loss}
+        row.update(lr_columns(optimizer))
+        history.append(row)
         print(
             f"[FinalTrain E{ep}/{stop_epoch}] train_loss={avg_train_loss:.3f} | "
-            f"lr={scheduler.get_last_lr()[0]:.2e}"
+            f"lr={format_lrs(optimizer)}"
         )
         scheduler.step()
 
