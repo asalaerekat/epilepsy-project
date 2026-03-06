@@ -26,11 +26,12 @@ python /sc/arion/projects/StrokeCode/DLC/DeepLearningVideoClassification/train.p
     --num_frames 16 \
     --model resnet3d \
     --pretrained \
+    --eval_num_workers 0 \
     --epochs 50 \
     --batch_size 10 \
     --k_folds 3 \
     --learning_rate 1e-3 \
-    --layer4_learning_rate 1e-4 \
+    --layer4_learning_rate 1e-3 \
     --weight_decay 1e-4 \
     --scheduler step \
     --lr_step_size 10 \
@@ -39,4 +40,3 @@ python /sc/arion/projects/StrokeCode/DLC/DeepLearningVideoClassification/train.p
     --use_avg_youden_threshold \
     --output_dir /sc/arion/projects/StrokeCode/DLC/DeepLearningVideoClassification/checkpoints \
     --plot_dir /sc/arion/projects/StrokeCode/DLC/DeepLearningVideoClassification/plots
-    

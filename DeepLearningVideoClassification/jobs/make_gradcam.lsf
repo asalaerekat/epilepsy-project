@@ -1,0 +1,47 @@
+#!/bin/bash
+#BSUB -J makegradcam
+#BSUB -P acc_StrokeCode
+#BSUB -q gpu
+#BSUB -n 2
+#BSUB -R v100
+#BSUB -R "rusage[mem=100000]"
+#BSUB -o %J.stdout
+#BSUB -eo %J.stderr
+#BSUB -L /bin/bash
+#BSUB -W 12:00
+#BSUB -gpu num=1
+
+ml spider anaconda
+module load anaconda3/latest
+ml proxies
+source activate /sc/arion/work/erekaa02/.conda/envs/DLC
+module load cuda
+module load cudnn/8.9.5-12
+
+
+LAYERS=(
+  stem.0
+  layer1.0.conv2 layer1.1.conv2
+  layer2.0.conv2 layer2.1.conv2
+  layer3.0.conv2 layer3.1.conv2
+  layer4.0.conv2 layer4.1.conv2
+)
+
+for L in "${LAYERS[@]}"; do
+  SAFE="${L//./_}"
+  python /sc/arion/projects/StrokeCode/DLC/DeepLearningVideoClassification/scripts/make_gradcam_video.py \
+    --video_dir /sc/arion/projects/StrokeCode/DLC/DeepLearningVideoClassification/videos/new_videos \
+    --checkpoint_path /sc/arion/projects/StrokeCode/DLC/DeepLearningVideoClassification/checkpoints/final_model.pth \
+    --filename 150_6_ES.mp4 \
+    --target_layer "$L" \
+    --model resnet3d \
+    --num_classes 1 \
+    --class_idx 0 \
+    --num_frames 16 \
+    --device cuda \
+    --save_format both \
+    --cam_threshold 0.5 \
+    --cam_gamma 2.0 \
+    --alpha 0.6 \
+    --output_dir /sc/arion/projects/StrokeCode/DLC/DeepLearningVideoClassification/gradcam_outputs/"$SAFE"
+done

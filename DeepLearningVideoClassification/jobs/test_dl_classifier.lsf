@@ -1,0 +1,31 @@
+#!/bin/bash
+#BSUB -J r3d18_test_external
+#BSUB -P acc_StrokeCode
+#BSUB -q gpuexpress
+#BSUB -n 4
+#BSUB -R v100
+#BSUB -R "rusage[mem=100000]"
+#BSUB -o %J.stdout
+#BSUB -eo %J.stderr
+#BSUB -L /bin/bash
+#BSUB -W 12:00
+#BSUB -gpu num=1
+
+ml spider anaconda
+module load anaconda3/latest
+ml proxies
+source activate /sc/arion/work/erekaa02/.conda/envs/DLC
+module load cuda
+module load cudnn/8.9.5-12
+
+python /sc/arion/projects/StrokeCode/DLC/DeepLearningVideoClassification/train.py \
+  --run_mode test_only \
+  --external_video_dir /sc/arion/projects/StrokeCode/DLC/DeepLearningVideoClassification/videos/new_videos \
+  --checkpoint_path /sc/arion/projects/StrokeCode/DLC/DeepLearningVideoClassification/checkpoints/final_model.pth \
+  --device cuda \
+  --model resnet3d \
+  --num_frames 16 \
+  --eval_batch_size 1 \
+  --eval_num_workers 1 \
+  --output_dir /sc/arion/projects/StrokeCode/DLC/DeepLearningVideoClassification/checkpoints \
+  --plot_dir /sc/arion/projects/StrokeCode/DLC/DeepLearningVideoClassification/plots
