@@ -41,13 +41,21 @@ class GradCAM3D:
 
     def _register_hooks(self):
         def forward_hook(_, __, output):
+            # Capture forward activations and attach a tensor-level gradient hook.
+            # This avoids module backward-hook + in-place op conflicts in some torchvision backbones.
+            if not isinstance(output, torch.Tensor):
+                raise TypeError(
+                    "Target layer output must be a Tensor for Grad-CAM. "
+                    f"Got {type(output)}."
+                )
             self.activations = output
 
-        def backward_hook(_, __, grad_out):
-            self.gradients = grad_out[0]
+            def _save_grad(grad):
+                self.gradients = grad
+
+            output.register_hook(_save_grad)
 
         self.handles.append(self.target_layer.register_forward_hook(forward_hook))
-        self.handles.append(self.target_layer.register_full_backward_hook(backward_hook))
 
     def close(self):
         for handle in self.handles:
@@ -117,7 +125,14 @@ class GradCAM3D:
 
         n, k = logits.shape
         if k == 1:
-            score = logits[:, 0].sum()
+            # For binary head: class_idx=1 -> seizure evidence (logit)
+            #                  class_idx=0 -> non-seizure evidence (-logit)
+            if class_idx is None or class_idx == 1:
+                score = logits[:, 0].sum()
+            elif class_idx == 0:
+                score = (-logits[:, 0]).sum()
+            else:
+                raise ValueError("For binary head (N,1), class_idx must be 0 (nonseizure) or 1 (seizure).")
         else:
             idx = self._resolve_class_indices(logits, class_idx)
             score = logits[torch.arange(n, device=logits.device), idx].sum()

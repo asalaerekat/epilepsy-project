@@ -22,6 +22,10 @@ def get_args():
     parser.add_argument("--pretrained", action="store_true", help="Use pretrained weights")
     parser.add_argument("--num_classes", type=int, default=2, help="Number of classes")
     parser.add_argument("--num_workers", type=int, default=1, help="Number of workers")
+    parser.add_argument("--eval_num_workers", type=int, default=0,
+                        help="Number of workers for external evaluation DataLoader (0 avoids worker deadlocks)")
+    parser.add_argument("--eval_batch_size", type=int, default=1,
+                        help="Batch size for external evaluation (smaller values reduce OOM risk on long videos)")
     
     # Training parameters
     parser.add_argument("--batch_size", type=int, default=4)

@@ -44,6 +44,8 @@ class VideoDataset(Dataset):
         print("VideoDataset: found", len(self.video_files), "files")
         self.num_frames = num_frames
         self.transform  = transform
+        self.start_trim_sec = 118.0
+        self.end_trim_sec = 120.0
 
     def __len__(self):
         return len(self.video_files)
@@ -59,8 +61,35 @@ class VideoDataset(Dataset):
         path  = os.path.join(self.video_dir, fn)
         label = self._get_label(fn)
 
-        vid, _, info = io.read_video(path, pts_unit="sec")  # (T,H,W,C)
-        fps = info.get("video_fps", 25)
+        # Decode only the usable temporal window to avoid loading full long videos in memory.
+        try:
+            timestamps, _ = io.read_video_timestamps(path, pts_unit="sec")
+        except Exception as exc:
+            raise RuntimeError(f"Failed reading timestamps for {fn}") from exc
+        if len(timestamps) == 0:
+            raise ValueError(f"{fn} has no readable video frames")
+
+        duration_sec = float(timestamps[-1])
+        clip_start_sec = self.start_trim_sec
+        clip_end_sec = duration_sec - self.end_trim_sec
+        if clip_end_sec <= clip_start_sec:
+            raise ValueError(
+                f"{fn} too short after cut: duration={duration_sec:.2f}s, "
+                f"needs > {self.start_trim_sec + self.end_trim_sec:.2f}s"
+            )
+
+        vid, _, _ = io.read_video(
+            path,
+            start_pts=clip_start_sec,
+            end_pts=clip_end_sec,
+            pts_unit="sec",
+        )  # (T,H,W,C)
+        if vid.numel() == 0:
+            raise ValueError(
+                f"{fn} produced empty clip after cut window "
+                f"[{clip_start_sec:.2f}, {clip_end_sec:.2f}] sec"
+            )
+
         vid = vid.permute(0,3,1,2)  #  (T,C,H,W)
 
         # ensure 3 channels
@@ -69,25 +98,15 @@ class VideoDataset(Dataset):
         elif vid.shape[1]>3:
             vid = vid[:,:3]
 
-        # cut start/end
-        start = int(118*fps)
-        end   = int(120*fps)
-        Ttot  = vid.shape[0]
-        if Ttot > start+end:
-            vid = vid[start:Ttot-end]
-        else:
-            raise ValueError(f"{fn} too short after cut")
-
         # sample/pad to fixed length
         Tnow = vid.shape[0]
         if Tnow >= self.num_frames:
             idxs = torch.linspace(0, Tnow-1, steps=self.num_frames).long()
             vid = vid[idxs]
         else:
-            last = vid[-1:]
-            while vid.shape[0] < self.num_frames:
-                vid = torch.cat([vid, last], dim=0)
-            vid = vid[:self.num_frames]
+            pad_count = self.num_frames - Tnow
+            pad = vid[-1:].repeat(pad_count, 1, 1, 1)
+            vid = torch.cat([vid, pad], dim=0)
 
         # → (C,T,H,W)
         vid = vid.permute(1,0,2,3)

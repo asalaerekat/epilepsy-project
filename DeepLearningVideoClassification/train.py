@@ -567,7 +567,7 @@ def evaluate_external(
         args.external_video_dir, args.num_frames, transform=val_transform, dataset_name="external"
     )
     external_loader = DataLoader(
-        external_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers
+        external_ds, batch_size=args.eval_batch_size, shuffle=False, num_workers=args.eval_num_workers
     )
 
     manifest_df = pd.DataFrame({"filename": external_ds.video_files})
@@ -581,7 +581,59 @@ def evaluate_external(
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))
 
     criterion = nn.BCEWithLogitsLoss()
-    loss, _, probs, labels = eval_epoch(model, external_loader, criterion, device)
+    try:
+        loss, logits, probs, labels = eval_epoch(model, external_loader, criterion, device)
+    except Exception as exc:
+        raise RuntimeError(
+            "External evaluation failed while loading videos. "
+            "If this is a DataLoader worker hang/crash, run with "
+            "`--eval_num_workers 0` (default) and verify external videos are readable."
+        ) from exc
+
+    if len(external_ds.video_files) != len(probs):
+        raise RuntimeError(
+            "External prediction length mismatch: "
+            f"filenames={len(external_ds.video_files)} vs predictions={len(probs)}"
+        )
+
+    primary_preds = (probs >= float(primary_threshold)).astype(int)
+    default_preds = (probs >= 0.5).astype(int)
+    per_video_df = pd.DataFrame(
+        {
+            "filename": external_ds.video_files,
+            "true_label": labels.astype(int),
+            "true_label_name": np.where(
+                labels.astype(int) == 0, "PNEE/FDS", "GTC/FocalBilateralTC/ES"
+            ),
+            "logit": logits.astype(float),
+            "prob_class1": probs.astype(float),
+            "primary_threshold": float(primary_threshold),
+            "threshold_source": threshold_source,
+            "pred_label_primary_threshold": primary_preds,
+            "pred_label_name_primary_threshold": np.where(
+                primary_preds == 0, "PNEE/FDS", "GTC/FocalBilateralTC/ES"
+            ),
+            "is_correct_primary_threshold": (primary_preds == labels.astype(int)).astype(int),
+            "pred_label_0_5": default_preds,
+            "pred_label_name_0_5": np.where(
+                default_preds == 0, "PNEE/FDS", "GTC/FocalBilateralTC/ES"
+            ),
+            "is_correct_0_5": (default_preds == labels.astype(int)).astype(int),
+        }
+    )
+    save_df(
+        per_video_df,
+        os.path.join(args.output_dir, "external_video_predictions.csv"),
+        os.path.join(args.output_dir, "external_video_predictions.xlsx"),
+    )
+
+    misclassified_df = per_video_df[per_video_df["is_correct_primary_threshold"] == 0].copy()
+    save_df(
+        misclassified_df,
+        os.path.join(args.output_dir, "external_misclassified_videos.csv"),
+        os.path.join(args.output_dir, "external_misclassified_videos.xlsx"),
+    )
+
     auroc = compute_auc(probs, labels)
     auprc = compute_auprc(probs, labels)
 
@@ -676,6 +728,9 @@ def resolve_test_threshold(args):
 def main():
     args = get_args()
     seed = 42
+
+    if args.eval_batch_size < 1:
+        raise ValueError("--eval_batch_size must be >= 1.")
 
     if args.device == "cuda" and not torch.cuda.is_available():
         print("CUDA requested but not available. Falling back to CPU.")
