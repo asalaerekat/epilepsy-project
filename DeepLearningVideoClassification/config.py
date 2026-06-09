@@ -55,5 +55,24 @@ def get_args():
                         help="Checkpoint path for test_only mode. Defaults to <output_dir>/final_model.pth")
     parser.add_argument("--threshold", type=float, default=None,
                         help="Explicit threshold for test_only mode. If omitted, loads final_threshold.json or uses 0.5")
+    
+    # this is for different sampling techniques
+    parser.add_argument("--sample_mode", type=str, default="random_clip",
+                    choices=["sparse", "random_clip", "center_clip"],
+                    help="How to sample frames from each video.")
+
+    parser.add_argument("--clip_fps", type=float, default=4.0,
+                        help="Effective frame rate inside each sampled clip.")
+
+    parser.add_argument("--num_test_clips", type=int, default=20,
+                        help="Number of deterministic clips per video during multi-clip testing.")
+
+    parser.add_argument("--aggregation", type=str, default="topk_mean",
+                        choices=["mean", "max", "topk_mean"],
+                        help="How to aggregate clip probabilities into a video probability.")
+
+    parser.add_argument("--topk", type=int, default=5,
+                        help="Top-k clips used when aggregation=topk_mean.")
+        
     args = parser.parse_args()
     return args
