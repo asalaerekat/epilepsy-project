@@ -31,27 +31,30 @@ def set_seed(seed: int) -> None:
 
 
 def build_transforms():
-    train_tf = T.Compose([
-        T.Resize((128, 171)),
-        T.RandomResizedCrop((112, 112), scale=(0.8, 1.0), ratio=(0.9, 1.1)),
-        T.RandomHorizontalFlip(0.5),
-        T.ColorJitter(0.2, 0.2, 0.2, 0.1),
-        T.RandomGrayscale(0.1),
-        T.GaussianBlur((3, 3), sigma=(0.1, 2.0)),
-        T.ToTensor(),
-        T.Normalize([0.43216, 0.394666, 0.37645], [0.22803, 0.22145, 0.216989]),
-    ])
-    val_tf = T.Compose([
-        T.Resize((128, 171)),
-        T.CenterCrop((112, 112)),
-        T.ToTensor(),
-        T.Normalize([0.43216, 0.394666, 0.37645], [0.22803, 0.22145, 0.216989]),
-    ])
-    return VideoAugmentation(train_tf), VideoAugmentation(val_tf)
+    # New: clip-consistent augmentation. Random crop/flip are sampled once per clip
+    # and applied to every frame, preserving temporal coherence for the 3D CNN.
+    train_tf = VideoAugmentation(is_train=True)
+    val_tf = VideoAugmentation(is_train=False)
+    return train_tf, val_tf
 
 
-def build_dataset(video_dir, num_frames, transform, file_list=None, dataset_name="dataset"):
-    ds = VideoDataset(video_dir, num_frames=num_frames, transform=transform, file_list=file_list)
+def build_dataset(
+    video_dir,
+    num_frames,
+    transform,
+    file_list=None,
+    dataset_name="dataset",
+    sample_mode="center_clip",
+    clip_fps=4.0,
+):
+    ds = VideoDataset(
+        video_dir,
+        num_frames=num_frames,
+        transform=transform,
+        file_list=file_list,
+        sample_mode=sample_mode,
+        clip_fps=clip_fps,
+    )
     if len(ds) == 0:
         raise ValueError(
             f"No videos found in {dataset_name} directory: {video_dir}. "
@@ -204,6 +207,28 @@ def save_df(df, csv_path, xlsx_path):
     df.to_excel(xlsx_path, index=False)
 
 
+def aggregate_clip_probs(probs, aggregation="topk_mean", topk=5):
+    probs = np.asarray(probs, dtype=float)
+    if probs.size == 0:
+        raise ValueError("Cannot aggregate an empty probability array.")
+
+    if aggregation == "mean":
+        return float(np.mean(probs))
+    if aggregation == "max":
+        return float(np.max(probs))
+    if aggregation == "topk_mean":
+        k = int(max(1, min(topk, probs.size)))
+        return float(np.mean(np.sort(probs)[-k:]))
+    raise ValueError(f"Unsupported aggregation: {aggregation}")
+
+
+def binary_cross_entropy_from_probs(probs, labels, eps=1e-7):
+    probs = np.asarray(probs, dtype=float)
+    labels = np.asarray(labels, dtype=float)
+    probs = np.clip(probs, eps, 1.0 - eps)
+    return float(-np.mean(labels * np.log(probs) + (1.0 - labels) * np.log(1.0 - probs)))
+
+
 def format_lrs(optimizer):
     pieces = []
     for i, group in enumerate(optimizer.param_groups):
@@ -223,7 +248,12 @@ def lr_columns(optimizer):
 
 def run_kfold_cv(args, device, train_transform, val_transform):
     internal_base_ds = build_dataset(
-        args.video_dir, args.num_frames, transform=None, dataset_name="internal"
+        args.video_dir,
+        args.num_frames,
+        transform=None,
+        dataset_name="internal",
+        sample_mode=args.val_sample_mode,
+        clip_fps=args.clip_fps,
     )
     all_files = sorted(internal_base_ds.video_files)
     groups = np.array([extract_patient_group(fn) for fn in all_files])
@@ -261,10 +291,20 @@ def run_kfold_cv(args, device, train_transform, val_transform):
             raise RuntimeError(f"Group leakage detected in fold {fold}.")
 
         tr_ds = build_dataset(
-            args.video_dir, args.num_frames, transform=train_transform, file_list=tr_files
+            args.video_dir,
+            args.num_frames,
+            transform=train_transform,
+            file_list=tr_files,
+            sample_mode=args.train_sample_mode,
+            clip_fps=args.clip_fps,
         )
         cv_ds = build_dataset(
-            args.video_dir, args.num_frames, transform=val_transform, file_list=cv_files
+            args.video_dir,
+            args.num_frames,
+            transform=val_transform,
+            file_list=cv_files,
+            sample_mode=args.val_sample_mode,
+            clip_fps=args.clip_fps,
         )
 
         tr_loader = DataLoader(
@@ -492,7 +532,12 @@ def save_final_threshold(args, cv_results):
 
 def train_final_model(args, device, train_transform, stop_epoch):
     internal_ds = build_dataset(
-        args.video_dir, args.num_frames, transform=train_transform, dataset_name="internal"
+        args.video_dir,
+        args.num_frames,
+        transform=train_transform,
+        dataset_name="internal",
+        sample_mode=args.train_sample_mode,
+        clip_fps=args.clip_fps,
     )
     train_loader = DataLoader(
         internal_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers
@@ -552,6 +597,47 @@ def train_final_model(args, device, train_transform, stop_epoch):
     return model_path
 
 
+def predict_multiclip_video(model, dataset, filename, args, device):
+    clips, label, clip_rows = dataset.get_multiclip(filename, num_clips=args.num_test_clips)
+    model.eval()
+
+    all_logits = []
+    all_probs = []
+    batch_size = max(1, int(args.eval_batch_size))
+
+    with torch.no_grad():
+        for start in range(0, clips.shape[0], batch_size):
+            x = clips[start:start + batch_size].to(device)
+            logits = model(x).squeeze(1)
+            probs = torch.sigmoid(logits)
+            all_logits.extend(logits.detach().cpu().numpy().astype(float).tolist())
+            all_probs.extend(probs.detach().cpu().numpy().astype(float).tolist())
+
+    video_prob = aggregate_clip_probs(
+        all_probs,
+        aggregation=args.aggregation,
+        topk=args.topk,
+    )
+
+    for row, logit, prob in zip(clip_rows, all_logits, all_probs):
+        row["clip_logit"] = float(logit)
+        row["clip_prob_class1"] = float(prob)
+        row["aggregation"] = args.aggregation
+        row["topk"] = int(args.topk)
+        row["num_test_clips_requested"] = int(args.num_test_clips)
+
+    return {
+        "filename": filename,
+        "true_label": int(label),
+        "prob_class1": float(video_prob),
+        "n_clips": int(len(all_probs)),
+        "clip_prob_min": float(np.min(all_probs)),
+        "clip_prob_max": float(np.max(all_probs)),
+        "clip_prob_mean": float(np.mean(all_probs)),
+        "clip_prob_topk_mean": float(aggregate_clip_probs(all_probs, "topk_mean", args.topk)),
+    }, clip_rows
+
+
 def evaluate_external(
     args,
     device,
@@ -563,11 +649,15 @@ def evaluate_external(
     if not args.external_video_dir:
         raise ValueError("--external_video_dir is required for external evaluation.")
 
+    # New external evaluation: sample multiple local clips per video, predict each clip,
+    # then aggregate clip probabilities into one video-level probability.
     external_ds = build_dataset(
-        args.external_video_dir, args.num_frames, transform=val_transform, dataset_name="external"
-    )
-    external_loader = DataLoader(
-        external_ds, batch_size=args.eval_batch_size, shuffle=False, num_workers=args.eval_num_workers
+        args.external_video_dir,
+        args.num_frames,
+        transform=val_transform,
+        dataset_name="external",
+        sample_mode="center_clip",
+        clip_fps=args.clip_fps,
     )
 
     manifest_df = pd.DataFrame({"filename": external_ds.video_files})
@@ -580,51 +670,57 @@ def evaluate_external(
     model = get_model(args.model, args.pretrained, 1).to(device)
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))
 
-    criterion = nn.BCEWithLogitsLoss()
-    try:
-        loss, logits, probs, labels = eval_epoch(model, external_loader, criterion, device)
-    except Exception as exc:
-        raise RuntimeError(
-            "External evaluation failed while loading videos. "
-            "If this is a DataLoader worker hang/crash, run with "
-            "`--eval_num_workers 0` (default) and verify external videos are readable."
-        ) from exc
+    video_rows = []
+    all_clip_rows = []
+    for filename in external_ds.video_files:
+        try:
+            video_row, clip_rows = predict_multiclip_video(model, external_ds, filename, args, device)
+        except Exception as exc:
+            raise RuntimeError(f"External multi-clip evaluation failed for {filename}") from exc
+        video_rows.append(video_row)
+        all_clip_rows.extend(clip_rows)
 
-    if len(external_ds.video_files) != len(probs):
-        raise RuntimeError(
-            "External prediction length mismatch: "
-            f"filenames={len(external_ds.video_files)} vs predictions={len(probs)}"
-        )
+    per_video_df = pd.DataFrame(video_rows)
+    labels = per_video_df["true_label"].to_numpy(dtype=int)
+    probs = per_video_df["prob_class1"].to_numpy(dtype=float)
+    loss = binary_cross_entropy_from_probs(probs, labels)
 
     primary_preds = (probs >= float(primary_threshold)).astype(int)
     default_preds = (probs >= 0.5).astype(int)
-    per_video_df = pd.DataFrame(
-        {
-            "filename": external_ds.video_files,
-            "true_label": labels.astype(int),
-            "true_label_name": np.where(
-                labels.astype(int) == 0, "PNEE/FDS", "GTC/FocalBilateralTC/ES"
-            ),
-            "logit": logits.astype(float),
-            "prob_class1": probs.astype(float),
-            "primary_threshold": float(primary_threshold),
-            "threshold_source": threshold_source,
-            "pred_label_primary_threshold": primary_preds,
-            "pred_label_name_primary_threshold": np.where(
-                primary_preds == 0, "PNEE/FDS", "GTC/FocalBilateralTC/ES"
-            ),
-            "is_correct_primary_threshold": (primary_preds == labels.astype(int)).astype(int),
-            "pred_label_0_5": default_preds,
-            "pred_label_name_0_5": np.where(
-                default_preds == 0, "PNEE/FDS", "GTC/FocalBilateralTC/ES"
-            ),
-            "is_correct_0_5": (default_preds == labels.astype(int)).astype(int),
-        }
+
+    per_video_df["true_label_name"] = np.where(
+        labels == 0, "PNEE/FDS", "GTC/FocalBilateralTC/ES"
     )
+    per_video_df["primary_threshold"] = float(primary_threshold)
+    per_video_df["threshold_source"] = threshold_source
+    per_video_df["pred_label_primary_threshold"] = primary_preds
+    per_video_df["pred_label_name_primary_threshold"] = np.where(
+        primary_preds == 0, "PNEE/FDS", "GTC/FocalBilateralTC/ES"
+    )
+    per_video_df["is_correct_primary_threshold"] = (primary_preds == labels).astype(int)
+    per_video_df["pred_label_0_5"] = default_preds
+    per_video_df["pred_label_name_0_5"] = np.where(
+        default_preds == 0, "PNEE/FDS", "GTC/FocalBilateralTC/ES"
+    )
+    per_video_df["is_correct_0_5"] = (default_preds == labels).astype(int)
+    per_video_df["aggregation"] = args.aggregation
+    per_video_df["topk"] = int(args.topk)
+    per_video_df["num_test_clips_requested"] = int(args.num_test_clips)
+    per_video_df["num_frames"] = int(args.num_frames)
+    per_video_df["clip_fps"] = float(args.clip_fps)
+    per_video_df["local_clip_duration_sec"] = float(args.num_frames) / float(args.clip_fps)
+
     save_df(
         per_video_df,
         os.path.join(args.output_dir, "external_video_predictions.csv"),
         os.path.join(args.output_dir, "external_video_predictions.xlsx"),
+    )
+
+    clip_df = pd.DataFrame(all_clip_rows)
+    save_df(
+        clip_df,
+        os.path.join(args.output_dir, "external_clip_predictions.csv"),
+        os.path.join(args.output_dir, "external_clip_predictions.xlsx"),
     )
 
     misclassified_df = per_video_df[per_video_df["is_correct_primary_threshold"] == 0].copy()
@@ -658,6 +754,11 @@ def evaluate_external(
                 "fp": m["fp"],
                 "fn": m["fn"],
                 "tp": m["tp"],
+                "aggregation": args.aggregation,
+                "topk": int(args.topk),
+                "num_test_clips": int(args.num_test_clips),
+                "num_frames": int(args.num_frames),
+                "clip_fps": float(args.clip_fps),
             }
         )
 
@@ -689,17 +790,23 @@ def evaluate_external(
                 "fp": primary_row["fp"],
                 "fn": primary_row["fn"],
                 "tp": primary_row["tp"],
+                "aggregation": args.aggregation,
+                "topk": int(args.topk),
+                "num_test_clips": int(args.num_test_clips),
+                "num_frames": int(args.num_frames),
+                "clip_fps": float(args.clip_fps),
             }
         ]
     )
     summary_df.to_csv(os.path.join(args.output_dir, "external_eval_summary.csv"), index=False)
 
     print(
-        f"External eval | checkpoint={checkpoint_path} | threshold={primary_threshold:.4f} "
-        f"({threshold_source}) | loss={loss:.3f} | AUROC={auroc:.3f} | AUPRC={auprc:.3f}"
+        f"External multi-clip eval | checkpoint={checkpoint_path} | "
+        f"threshold={primary_threshold:.4f} ({threshold_source}) | "
+        f"clips/video={args.num_test_clips} | aggregation={args.aggregation} | "
+        f"loss={loss:.3f} | AUROC={auroc:.3f} | AUPRC={auprc:.3f}"
     )
     return summary_df.iloc[0].to_dict()
-
 
 def resolve_test_checkpoint(args):
     if args.checkpoint_path is not None:
